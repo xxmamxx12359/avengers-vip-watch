@@ -1,4 +1,4 @@
-import json, os, time
+import json, os, re, time
 import requests
 from bs4 import BeautifulSoup
 
@@ -7,9 +7,25 @@ SHOWTIMES = BASE + "/showtimes?c=city-centre-alexandria&c=mall-of-egypt&m=avenge
 TOPIC = os.environ["NTFY_TOPIC"]
 STATE_FILE = "state.json"
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Mobile Safari/537.36",
     "Accept-Language": "en",
 }
+
+def new_session():
+    s = requests.Session()
+    s.headers.update(HEADERS)
+    return s
+
+def get(s, url):
+    last = None
+    for attempt in range(3):
+        try:
+            return s.get(url, timeout=30)
+        except requests.RequestException as e:
+            last = e
+            print(f"  attempt {attempt + 1} failed: {type(e).__name__}")
+            time.sleep(5)
+    raise last
 
 def notify(title, msg, click):
     requests.post(
@@ -19,19 +35,8 @@ def notify(title, msg, click):
         timeout=15,
     )
 
-def get(s, url):
-    last = None
-    for attempt in range(3):
-        try:
-            return s.get(url, timeout=60)
-        except requests.RequestException as e:
-            last = e
-            print(f"attempt {attempt + 1} failed: {type(e).__name__}")
-            time.sleep(10)
-    raise last
-
-def open_sessions(s):
-    soup = BeautifulSoup(get(s, SHOWTIMES).text, "html.parser")
+def open_sessions():
+    soup = BeautifulSoup(get(new_session(), SHOWTIMES).text, "html.parser")
     ids = []
     for el in soup.select("[data-id]"):
         sp = el if "showtime" in el.get("class", []) else el.select_one("span.action.showtime")
@@ -40,42 +45,61 @@ def open_sessions(s):
         ids.append(el["data-id"])
     return sorted(set(ids))
 
-def free_premium_seats(s, sid):
-    soup = BeautifulSoup(get(s, f"{BASE}/booking/{sid}").text, "html.parser")
+def seat_page(sid):
+    s = new_session()
+    r = get(s, f"{BASE}/booking/{sid}")
+    m = re.search(r"/booking/([^/?#]+)", r.url)
+    if not m or m.group(1) == sid:
+        raise RuntimeError(f"no booking token (landed on {r.url})")
+    tok = m.group(1)
+    r = get(s, f"{BASE}/booking/{tok}/seats/fetch")
+    if 'class="seat' in r.text:
+        return r.text
+    for _ in range(10):
+        try:
+            j = get(s, f"{BASE}/booking/{tok}/seats/processing?json=1").json()
+            if j.get("data", {}).get("status") == 1:
+                break
+        except ValueError:
+            pass
+        time.sleep(1)
+    return get(s, f"{BASE}/booking/{tok}/seats").text
+
+def free_premium_seats(sid):
+    soup = BeautifulSoup(seat_page(sid), "html.parser")
+    cells = soup.select("td.seat.premium")
+    if not soup.select("td.seat"):
+        raise RuntimeError("seat map not found")
     free = []
-    for td in soup.select("td.seat.premium"):
+    for td in cells:
         if "sold" in td.get("class", []):
             continue
         inp = td.find("input", attrs={"name": "seat"})
         if inp and not inp.has_attr("disabled"):
             free.append(inp.get("data-label", "?"))
-    return set(free)
+    return set(free), len(cells)
 
 def main():
-    s = requests.Session()
-    s.headers.update(HEADERS)
     state = json.load(open(STATE_FILE)) if os.path.exists(STATE_FILE) else {}
-
     try:
-        sessions = open_sessions(s)
+        sessions = open_sessions()
     except Exception as e:
-        print(f"Site not reachable this run, will retry in 5 minutes: {e}")
+        print(f"Showtimes page not reachable: {e}")
         return
-
+    print(time.strftime("%H:%M:%S"), f"- {len(sessions)} open session(s)")
     for sid in sessions:
         try:
-            free = free_premium_seats(s, sid)
+            free, total = free_premium_seats(sid)
         except Exception as e:
-            print(f"{sid}: error {e}")
+            print(f"  {sid}: error {e}")
             continue
-        prev = set(state.get(sid, []))
-        new = free - prev
+        print(f"  {sid}: {len(free)}/{total} premium free")
+        new = free - set(state.get(sid, []))
         if new:
             notify("VIP seat available!", f"{sid}: {', '.join(sorted(new))}", f"{BASE}/booking/{sid}")
         state[sid] = sorted(free)
-
+        time.sleep(2)
     json.dump(state, open(STATE_FILE, "w"), indent=1)
-    print(f"Checked {len(sessions)} open session(s).")
 
 if __name__ == "__main__":
     main()
