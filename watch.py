@@ -1,4 +1,4 @@
-import json, os
+import json, os, time
 import requests
 from bs4 import BeautifulSoup
 
@@ -19,8 +19,19 @@ def notify(title, msg, click):
         timeout=15,
     )
 
+def get(s, url):
+    last = None
+    for attempt in range(3):
+        try:
+            return s.get(url, timeout=60)
+        except requests.RequestException as e:
+            last = e
+            print(f"attempt {attempt + 1} failed: {type(e).__name__}")
+            time.sleep(10)
+    raise last
+
 def open_sessions(s):
-    soup = BeautifulSoup(s.get(SHOWTIMES, timeout=30).text, "html.parser")
+    soup = BeautifulSoup(get(s, SHOWTIMES).text, "html.parser")
     ids = []
     for el in soup.select("[data-id]"):
         sp = el if "showtime" in el.get("class", []) else el.select_one("span.action.showtime")
@@ -30,8 +41,7 @@ def open_sessions(s):
     return sorted(set(ids))
 
 def free_premium_seats(s, sid):
-    r = s.get(f"{BASE}/booking/{sid}", timeout=30)
-    soup = BeautifulSoup(r.text, "html.parser")
+    soup = BeautifulSoup(get(s, f"{BASE}/booking/{sid}").text, "html.parser")
     free = []
     for td in soup.select("td.seat.premium"):
         if "sold" in td.get("class", []):
@@ -46,7 +56,13 @@ def main():
     s.headers.update(HEADERS)
     state = json.load(open(STATE_FILE)) if os.path.exists(STATE_FILE) else {}
 
-    for sid in open_sessions(s):
+    try:
+        sessions = open_sessions(s)
+    except Exception as e:
+        print(f"Site not reachable this run, will retry in 5 minutes: {e}")
+        return
+
+    for sid in sessions:
         try:
             free = free_premium_seats(s, sid)
         except Exception as e:
@@ -59,6 +75,7 @@ def main():
         state[sid] = sorted(free)
 
     json.dump(state, open(STATE_FILE, "w"), indent=1)
+    print(f"Checked {len(sessions)} open session(s).")
 
 if __name__ == "__main__":
     main()
